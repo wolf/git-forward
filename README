@@ -1,0 +1,56 @@
+Purpose:
+
+	Fetch, prune, and fast-forward any number of tracking branches over any
+	number of remotes at once.  You need not switch branches, and it is safe
+	to use even if when your index or tree happen to be dirty.  Useful to
+	integrators and others who must follow many shared branches.
+
+Description:
+
+	Think of `git forward` as a tool for providing a branch report very much
+	like `git branch -v` ... that also brings branches up-to-date (at least
+	where it was trivial to do so).
+
+	It provides full Perl-style regular expression matching against refnames
+	in your repo.  E.g., to see topic branches 
+
+	Considers the provided local branches, or else all local branches.
+	For any remote referenced by those branches, fetch and then prune as
+	required by the supplied options.  By default: --fetch --no-prune.
+
+	Unless this is just a --dry-run, any of the considered branches that are
+	strictly behind (contained by) their tracked branch are fast-forwarded
+	to the tracked tip.  Uncommitted changes are protected---they count as
+	behing 'ahead' of the tracked branch.
+
+Usage:
+
+	git forward [options] [<name|pattern>...]
+
+Options:
+
+	-h | --help	you're soaking in it! (hint: try -v -h)
+	--version
+	--license
+
+
+	# What to work on.  Defaults to config, or else: refs/heads/
+	<name>		the named ref, if git finds an exact match, or else <name>
+			is treated as a (Perl-style) regexp, and matched against
+			names in refs/heads/
+	-r		...also match against names in refs/heads/remotes/
+	-a		...match against any valid ref (implies -r)
+
+
+	# What work to do.
+	#   if --dry-run, defaults to: --no-fetch --no-prune --no-update
+	#   otherwise, defaults to config, or else: --fetch --update --no-prune
+	-n | --dry-run
+	-f | --fetch | --no-fetch	fetch referenced remotes
+	-p | --prune | --no-prune	prune referenced remotes
+	-u | --update | --no-update	fast-forward branches if possible
+
+
+	# How to report.  Default: --no-verbose
+	-v | --verbose | --no-verbose
+	--color	| --no-color		color (or not) printed refs

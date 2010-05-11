@@ -1,0 +1,1026 @@
+#!/usr/bin/perl
+
+# TODO:
+#	- autocomplete
+#	- tests
+
+use warnings;
+#use strict;
+use Getopt::Long 2.37 qw{GetOptionsFromString :config no_ignore_case permute bundling};
+use lib (split(/:/, $ENV{GITPERLLIB} || "/usr/local/lib/perl5/site_perl"));
+use Git;
+
+
+
+my %OPTIONS;
+my $REPO = Git->repository();
+
+
+sub version {
+	my($dont_exit) = @_;
+	print "Version 1.0";
+	unless ( $dont_exit ) {
+		print "\n";
+		exit 1;
+	}
+}
+
+sub license {
+	my($dont_exit) = @_;
+	version('don\'t exit!');
+	print <<END_LICENSE;
+, Copyright (c) 21 January 2009 by Wolf.
+Licensed under the GPL v2 or, at your discretion, a later version of the GPL.
+END_LICENSE
+	exit 1 unless $dont_exit;
+}
+
+
+sub usage {
+	my($m1, $m2) = @_;
+	my $error = $m2 || $m1;
+	print $error . "\n\n" if $error;
+
+	print <<END_USAGE;
+Usage:
+
+	git forward [options] [<name|pattern>...]
+
+Purpose:
+
+	Fetch, prune, and fast-forward any number of tracking branches over any
+	number of remotes at once.  You need not switch branches, and it is safe
+	to use even if when your index or tree happen to be dirty.  Useful to
+	integrators and others who must follow many shared branches.
+
+Options:
+
+	-h | --help	you're soaking in it! (hint: try -v -h)
+	--version
+	--license
+
+
+	# What to work on.  Defaults to config, or else: refs/heads/
+	<name>		the named ref, if git finds an exact match, or else <name>
+			is treated as a (Perl-style) regexp, and matched against
+			names in refs/heads/
+	-r		...also match against names in refs/heads/remotes/
+	-a		...match against any valid ref (implies -r)
+
+
+	# What work to do.
+	#   if --dry-run, defaults to: --no-fetch --no-prune --no-update
+	#   otherwise, defaults to config, or else: --fetch --update --no-prune
+	-n | --dry-run
+	-f | --fetch | --no-fetch	fetch referenced remotes
+	-p | --prune | --no-prune	prune referenced remotes
+	-u | --update | --no-update	fast-forward branches if possible
+
+
+	# How to report.  Default: --no-verbose
+	-v | --verbose | --no-verbose
+	--color	| --no-color		color (or not) printed refs
+END_USAGE
+
+	exit 1 if $error || !$OPTIONS{'verbose'};
+
+	print <<END_DESCRIPTION;
+
+Description:
+
+	Think of `git forward` as a tool for providing a branch report very much
+	like `git branch -v` ... that also brings branches up-to-date (at least
+	where it was trivial to do so).
+
+	It provides full Perl-style regular expression matching against refnames
+	in your repo.  E.g., to see topic branches 
+
+	Considers the provided local branches, or else all local branches.
+	For any remote referenced by those branches, fetch and then prune as
+	required by the supplied options.  By default: --fetch --no-prune.
+
+	Unless this is just a --dry-run, any of the considered branches that are
+	strictly behind (contained by) their tracked branch are fast-forwarded
+	to the tracked tip.  Uncommitted changes are protected---they count as
+	behing 'ahead' of the tracked branch.
+
+Configuration:
+
+	forward.fetch		default: true
+	forward.prune		default: auto => prune if you fetched
+	forward.update		default: true
+
+	forward.branches	default: ^refs/heads/
+
+	forward.verbose		default: false
+	color.forward		default: color.branch color.ui auto
+	color.forward.<slot>	as in color.branch.<slot>
+END_DESCRIPTION
+
+	exit 1;
+}
+
+{ package ResolveOpt;
+
+BEGIN {
+our ($VERSION, @ISA, @EXPORT_OK);
+
+require Exporter;
+
+@ISA = qw(Exporter);
+
+# Methods which can be called as standalone functions as well:
+@EXPORT_OK = qw(bool boolstring string);
+}
+
+
+my %BOOL_MAPPING = (
+	'1'	=> 1,
+	'always'=> 1,
+	'all'	=> 1,
+	'yes'	=> 1,
+	'true'	=> 1,
+	'auto'	=> 1,
+	'false'	=> 0,
+	'no'	=> 0,
+	'none'	=> 0,
+	'never'	=> 0,
+	'0'	=> 0
+);
+
+my %AS_STRING = (
+	MAP_FN		=> sub { my($v)=@_; return defined($v) ? $v : ''; }
+);
+
+my %GET_BOOL = (
+	IF_COMPLETE_VALUE	=> sub { my($v)=@_; return exists $BOOL_MAPPING{$v}; },
+	MAP_FN			=> sub {
+		my($s, $mapping) = @_;
+		if ( !defined($s) ) {
+			return undef;
+		} elsif ( !defined($mapping) || !exists $mapping->{$s} ) {
+			return $BOOL_MAPPING{$s};
+		}
+		my $r = $mapping->{$s};
+		return ref($r) eq 'CODE' ? $r->() : $r;
+	}
+);
+
+sub _collapse_fns {
+	my %collapsed;
+	while ( @_ && ref($_[0]) eq 'HASH' ){
+		my $fns = shift @_;
+		foreach my $k ( qw/IF_VALID_KEY LOOKUP_FN ACCUMULATE_FN IF_COMPLETE_VALUE MAP_FN MAPPING/ ){
+			my $fn = $fns->{$k};
+			$collapsed{$k} = $fn if defined($fn);
+		}
+	}
+	unshift @_, \%collapsed;
+	return @_;
+}
+
+sub _cascade {
+	sub undef_fn { return undef; }
+	sub identity_fn { my($v)=@_; return $v; }
+
+	my $NOT_WS = qr/\S/;
+	my %BASE_BEHAVIOR = (
+		IF_VALID_KEY		=> \&undef_fn,
+		LOOKUP_FN		=> \&undef_fn,
+		ACCUMULATE_FN		=> \&identity_fn,
+		IF_COMPLETE_VALUE	=> sub { my($v)=@_; return $v =~ /$NOT_WS/; },
+		MAP_FN			=> \&identity_fn
+	);
+
+	@_ = _collapse_fns(\%BASE_BEHAVIOR, grep { defined $_ } @_);
+	my $fns = shift @_;
+	my $sum;
+
+	while ( @_ ){
+		my $value = shift @_;
+		next unless defined($value);
+
+		if ( $fns->{IF_VALID_KEY}($value) ){
+			$value = $fns->{LOOKUP_FN}($value);
+			next unless defined($value);
+		}
+		$sum = $fns->{ACCUMULATE_FN}($value, $sum);
+		last if $fns->{IF_COMPLETE_VALUE}($sum);
+	}
+
+	return $fns->{MAP_FN}($sum, $fns->{MAPPING});
+}
+
+sub bool	{ return _cascade(\%GET_BOOL, @_); }
+sub boolstring	{ return _cascade(\%GET_BOOL, \%AS_STRING, @_); }
+sub string	{ return _cascade(\%AS_STRING, @_); }
+
+}
+
+my $VALID_GIT_CONFIG_KEY = qr/\w+(?:\.\w+)+/;
+my %FROM_GIT_CONFIG = (
+	IF_VALID_KEY	=> sub { my($k)=@_; return $k =~ $VALID_GIT_CONFIG_KEY; },
+	LOOKUP_FN	=> sub { my($k)=@_; chomp(my $v=qx/git config $k/); return $v; }
+);
+
+sub git_bool		{ return ResolveOpt::bool(\%FROM_GIT_CONFIG, @_); }
+sub git_string		{ return ResolveOpt::string(\%FROM_GIT_CONFIG, @_); }
+
+
+
+sub debug_print_hash {
+	my($label, $hash) = @_;
+	print "debug_print_hash [$label]:\n";
+	foreach my $key ( keys %$hash ){
+		my $value = "<undef>";
+		if ( defined($hash->{$key}) ) {
+			$value = $hash->{$key};
+		}
+		printf("  \'$key\' => $value\n");
+	}
+	print "\n\n";
+}
+
+
+
+{ package RefSpec;
+
+my %SLOT_FOR_REFKIND = (
+	'heads'		=> 'local',
+	'tags'		=> 'plain',
+	'remotes'	=> 'remote'
+);
+
+my %ref_cache;
+sub inspect {
+	my($refname) = @_;
+
+	# The full name of a ref is the canonical cache key.  Maybe that's what the caller gave us.
+	return $ref_cache{$refname} if defined($ref_cache{$refname});
+
+	# It's not in the cache---at least under that name.  Can we get its full name?
+	my $if_exists = !(system('git', 'show-ref', '--quiet', '--', $refname) >> 8);
+	chomp(my $full_name = $if_exists ? $REPO->command_oneline(['rev-parse', '--symbolic-full-name', $refname], { STDERR => 0 }) : $refname);
+
+	# If we found a better name then check the cache again.
+	if ( $full_name ne $refname && defined($ref_cache{$full_name}) ) {
+		# ok, it _was_ cached after all
+		my $cached_ref = $ref_cache{$full_name};
+		$ref_cache{$refname} = $cached_ref; # in case they ask again with the wrong name
+		return $cached_ref;
+	}
+
+	# It's definitely not in the cache.  Let's build and cache a brand new one.
+	my %ref = (
+		full_name	=> $full_name,
+		if_exists	=> $if_exists
+	);
+	$ref_cache{$full_name} = \%ref;	# Cache it under the canonical key...
+	$ref_cache{$refname} = \%ref if $refname ne $full_name; # ...and also under $refname, in case they ask again.
+
+	# Get the commit hash and subject.
+	reinspect_commit(\%ref) if $if_exists;
+
+	# We only need more information for refs in heads, tags, or remotes.
+	return \%ref unless $if_exists && $full_name =~ m{^refs/(heads|tags|remotes)/};
+	my $refkind = $1; # 'heads', 'tags', or 'remotes'
+
+	# The brief_name serves as a config key (for refs under 'heads' anyway), e.g., branch.$brief_name.merge,
+	#   but provides a human-readable label in any case.
+	my $brief_name = $full_name;
+	$brief_name =~ s{^refs/(?:heads/|remotes/)?}{};
+	$ref{'brief_name'} = $brief_name;
+
+	# The slot is used to select colors for output.
+	$ref{'slot'} = $SLOT_FOR_REFKIND{$refkind};
+
+	# For local branches, we want to know about tracking; but we're done for any other kind of ref.
+	return \%ref if $refkind ne 'heads';
+
+	# What does this ref track?  Leave if nothing.
+	my $remote = $REPO->config("branch.$brief_name.remote");
+	my $branch_at_remote = $REPO->config("branch.$brief_name.merge");
+	return \%ref unless $remote && $branch_at_remote;
+
+	$ref{'if_tracking'} = 1;
+	$ref{'remote'} = $remote;
+	$ref{'remote_branch'} = $branch_at_remote;
+	$ref{'remote_branch'} =~ s{^refs/heads}{refs/remotes/$remote} if $remote ne '.';
+
+	return \%ref;
+}
+
+sub reinspect_commit {
+	my($ref) = @_;
+	my $if_exists = $ref->{'if_exists'};
+	chomp(my $hash = $if_exists ? $REPO->command_oneline('rev-parse', $ref->{'full_name'}) : '0'*40);
+	$ref->{'hash'} = $hash;
+	chomp($ref->{'subject'} = $if_exists ? $REPO->command_oneline('log', '-1', '--pretty=format:%s', $hash) : '');
+}
+
+sub reinspect_checkout {
+	my($ref) = @_;
+	my $HEAD = inspect('HEAD');
+	my $if_current = $ref->{'full_name'} eq $HEAD->{'full_name'};
+
+	$ref->{'if_current'}		= $if_current;
+	$ref->{'if_index_dirty'}	= $if_current && system('git', 'diff-index', '--quiet', '--cached', 'HEAD')>>8;
+	$ref->{'if_tree_dirty'}		= $if_current && system('git', 'diff-files', '--quiet')>>8;
+	$ref->{'if_dirty'}		= $if_current && $ref->{'if_index_dirty'} || $ref->{'if_tree_dirty'};
+}
+
+sub reinspect_tracking {
+	my($ref) = @_;
+	my($local_commits, $remote_commits) = (0, 0);
+
+	if ( $ref->{'if_tracking'} ) {
+		my @revs = $REPO->command('rev-list', '--left-right', $ref->{'full_name'} . '...' . $ref->{'remote_branch'});
+		foreach my $elem (@revs) {
+			++$local_commits if $elem =~ /^</;
+			++$remote_commits if $elem =~ /^>/;
+		}
+	}
+
+	$ref->{'ahead'} = $local_commits;
+	$ref->{'behind'} = $remote_commits;
+}
+
+
+sub slot {
+	my($ref) = @_;
+	return 'invalid' unless $ref->{'if_exists'};
+	return 'current' if $ref->{'if_current'};
+	return $ref->{'slot'} || 'other';
+}
+
+sub label {
+	my($ref) = @_;
+	return $ref->{'brief_name'} || $ref->{'full_name'};
+}
+
+my @ALL_REFNAMES;
+sub select_matching {
+	my($pattern, $if_implicit) = @_;
+
+	my @found_refs;
+	my $refspec = inspect($pattern);
+	push @found_refs, $refspec;
+
+	if ( $refspec->{'if_exists'} ) {
+		++$OPTIONS{'exact_matches'};
+		$refspec->{ $if_implicit ? 'if_implicit' : 'if_explicit' } = 1;
+		push @found_refs, $refspec;
+	} else {
+		unless ( @ALL_REFNAMES ) {
+			@ALL_REFNAMES =
+				map { chomp($_); $_; }
+				qx{git for-each-ref --format="%(refname)"};
+		}
+
+		my $regexp = qr/$pattern/;
+		my @candidates =
+			grep { $_ =~ $regexp }
+			@ALL_REFNAMES;
+		if ( @candidates ) {
+			pop @found_refs;
+			foreach my $cn ( @candidates ){
+				++$OPTIONS{'patterns_matched'};
+				my $r = inspect($cn);
+				$r->{'if_regexp_match'} = 1;
+				$r->{ $if_implicit ? 'if_implicit' : 'if_explicit' } = 1;
+				push @found_refs, $r
+			}
+		} 
+	}
+
+	return @found_refs;
+};
+
+}
+
+{ package GitColors;
+
+use constant {
+	STOP_WORD	=> -1,
+	WILDCARD	=> 0,
+	COLOR_NAME	=> 1,
+	ATTRIBUTE_NAME	=> 2,
+
+	FOREGROUND_POS	=> 0,
+	BACKGROUND_POS	=> 1,
+	ATTRIBUTE_POS	=> 2,
+};
+
+my %COLOR_NAMES = (
+	'reset'		=> STOP_WORD,	# mutually exclusive with any other colors
+	'*'		=> WILDCARD,	# any color
+
+	'normal'	=> COLOR_NAME,
+	'black'		=> COLOR_NAME,
+	'red'		=> COLOR_NAME,
+	'green'		=> COLOR_NAME,
+	'yellow'	=> COLOR_NAME,
+	'blue'		=> COLOR_NAME,
+	'magenta'	=> COLOR_NAME,
+	'cyan'		=> COLOR_NAME,
+	'white'		=> COLOR_NAME,
+
+	'bold'		=> ATTRIBUTE_NAME,
+	'dim'		=> ATTRIBUTE_NAME,
+	'ul'		=> ATTRIBUTE_NAME,
+	'blink'		=> ATTRIBUTE_NAME,
+	'reverse'	=> ATTRIBUTE_NAME,
+);
+
+sub _colornames {
+	# I really want to work on an array.
+	# If I'm given a ref, I'll have to look into it.  Unify by making refs out of anything else.
+	my $maybe_colornames;
+	if ( @_ > 1 ) {			$maybe_colornames = \@_;	# array-ref to my list of arguments
+	} elsif ( ref($_[0]) ) {	$maybe_colornames = $_[0];	# actually got called with a ref
+	} else {			$maybe_colornames = \$_[0];
+	}
+
+	# A scalar ref hopefully means a string.
+	if ( ref($maybe_colornames) eq 'SCALAR' && $$maybe_colornames ) {
+		# Give me that array!
+		my @words = split /\s+/, $$maybe_colornames;
+		$maybe_colornames = \@words;
+	}
+
+	# If I don't have an array by now, I'll never get one.
+	return unless ref($maybe_colornames) eq 'ARRAY';
+
+	# return an array, _not_ an array ref
+	return	grep	{ exists $COLOR_NAMES{$_} }
+		map	{ lc($_) }
+		grep	{ $_ }
+		@$maybe_colornames;
+}
+
+sub colornames {
+	return grep { my $nk=$COLOR_NAMES{$_}; $nk>=COLOR_NAME } _colornames(@_);
+}
+
+sub _splay {
+	use sort 'stable';
+
+	my %counts;
+	my @words =
+		map	{ ++$counts{$COLOR_NAMES{$_}}; $_ }
+		sort	{ ($COLOR_NAMES{$a}||COLOR_NAME)<=>($COLOR_NAMES{$b}||COLOR_NAME) }
+		_colornames(@_);
+
+	return ($words[0], undef, undef) if $counts{+STOP_WORD};
+
+	my $attributes_count = $counts{+ATTRIBUTE_NAME} || 0;
+	my @attributes = splice @words, -$attributes_count, $attributes_count;
+	push @words, (undef, undef, undef);
+	$words[ATTRIBUTE_POS] = $attributes[0];
+
+	# returns an array, not an array-ref
+	return map { $_ if !$_ || $_ ne '*' } splice @words, 0, 3;
+}
+
+sub colorlist {
+	# ... is a color splay with undef slots removed.  It may well be an empty list.
+
+	# returns an array, not an array-ref
+	return grep { $_ } _splay(@_);
+}
+
+sub _colorstring { return join(' ', map { $_ ? $_ : '*' } _splay(@_)); }
+sub colorstring {
+	my @splay = _splay(@_);
+	if ( $splay[BACKGROUND_POS] && !$splay[FOREGROUND_POS] ) {
+		$splay[FOREGROUND_POS] = 'normal';
+	}
+	return join(' ', grep { $_ } @splay);
+}
+
+sub accumulate {
+	my @sum = _splay();
+	my %openings = (0=>0, 1=>1, 2=>2);
+
+	while ( @_ && %openings ){
+		my @more = _splay(shift @_);
+		for ( keys %openings ){
+			next unless $more[$_];
+			$sum[$_] = $more[$_];
+			delete $openings{$_};
+		}
+	}
+
+	# returns an array, not an array-ref
+	return @sum;
+}
+
+}
+
+{ package Report;
+
+#my @COLOR_SLOTS = (
+#	# for refs
+#	'current',
+#	'local',
+#	'remote',
+#	'plain',
+#	'invalid',
+#	'other',
+#
+#	# for other text
+#	'status',
+#	'warning'
+#);
+
+# updated, up-to-date
+# failed, out-of-date
+# candidate
+# current
+# non-tracking
+# heads, tags, remotes, local, remote
+
+my %SLOT_DEFAULTS = (
+	'candidate'		=> '',
+	'current'		=> 'green',
+	'dirty'			=> '',
+	'failed'		=> '',
+	'heads'			=> '',
+	'highlight'		=> 'bold',
+	'local'			=> '',
+	'non-tracking'		=> '',
+	'none'			=> '',
+	'other'			=> '',
+	'out-of-date'		=> '',
+	'plain'			=> '',
+	'remote'		=> 'red',
+	'remotes'		=> '',
+	'status'		=> '',
+	'tags'			=> '',
+	'tracked'		=> '',
+	'tracked-local'		=> '',
+	'tracked-remote'	=> '',
+	'tracking'		=> '',
+	'up-to-date'		=> '',
+	'updated'		=> '',
+	'warning'		=> '',
+);
+
+
+my %COLOR_CACHE;
+
+sub lookup_color {
+	my($cache_key) = @_;
+	my $cache_entry = $COLOR_CACHE{$cache_key};
+
+	unless ( $cache_entry ) {
+		# if we haven't looked up this slot before...
+
+		my $colorstring;
+		if ( exists $SLOT_DEFAULTS{$cache_key} ) {
+			# if caller gave me a slot, I'll resolve it
+			$colorstring = ::git_string("color.forward.$cache_key", "color.branch.$cache_key", $SLOT_DEFAULTS{$cache_key} || '');
+		} elsif ( GitColors::_colornames($cache_key) ) {
+			$colorstring = $cache_key;
+		}
+
+
+		$cache_entry = $COLOR_CACHE{$colorstring};
+
+		unless ( $cache_entry ) {
+			# not only have we not looked up the slot before but this is the first time we've seen this color combination
+			my %new_cache_entry = (
+				COLORSTRING => $colorstring
+			);
+			$cache_entry = \%new_cache_entry;
+			$COLOR_CACHE{$colorstring} = $cache_entry;
+			# ...so we can directly look up this color again
+		}
+
+		$COLOR_CACHE{$cache_key} = $cache_entry;
+		# ...so we can directly look up this slot again
+	}
+
+	return $cache_entry;
+};
+
+sub get_color {
+	return '' unless $OPTIONS{'color'};
+
+	my $cache_key = join(':', grep { $_ } @_);
+	my $cache_entry = $COLOR_CACHE{$cache_key};
+
+	unless ( $cache_entry ) {
+		my $colorstring = ResolveOpt::_cascade({
+			IF_VALID_KEY		=> sub { my($k)=@_; return 1; },
+			LOOKUP_FN		=> sub { my($k)=@_; my $ce=lookup_color($k); return $ce->{COLORSTRING}; },
+			IF_COMPLETE_VALUE	=> sub { my($v)=@_; my @cl=GitColors::colorlist($v); return @cl==3; },
+			ACCUMULATE_FN		=> sub { my($v,$sum)=@_; return join(' ', map { $_ ? $_ : '*' } GitColors::accumulate($sum, $v)); },
+			MAP_FN			=> sub { my($v)=@_; return GitColors::_colorstring($v); }
+		}, @_);
+		$cache_entry = lookup_color($colorstring);
+		$COLOR_CACHE{$cache_key} = $cache_entry;
+	}
+
+	unless ( defined $cache_entry->{ESCAPE_SEQUENCE} ) {
+		$cache_entry->{ESCAPE_SEQUENCE} = $REPO->get_color('', GitColors::colorstring($cache_entry->{COLORSTRING}));
+	}
+
+	return $cache_entry->{ESCAPE_SEQUENCE};
+}
+
+sub reset_color {
+	return get_color('reset') . get_color(@_);
+}
+
+sub debug_color_cache {
+	my $reset_color = get_color('reset');
+
+	print "COLOR_CACHE:\n";
+	foreach my $cache_key ( sort keys %COLOR_CACHE ) {
+		my $cache_entry = $COLOR_CACHE{$cache_key};
+
+		my $colorstring;
+		if ( $cache_entry->{COLORSTRING} ) {
+			$colorstring = "\'" . $cache_entry->{COLORSTRING} . "\'"
+		} else {
+			$colorstring = "<undef>";
+		}
+
+		my $message = $cache_key . " => " . $colorstring;
+
+		my $escape_sequence = $cache_entry->{ESCAPE_SEQUENCE};
+		if ( defined $escape_sequence ) {
+			$message = $escape_sequence . $message . $reset_color;
+		}
+
+		print "\t", $message, "\n";
+	}
+}
+
+
+
+
+
+my %classic_slot = (
+	'heads'		=> 'local',
+	'remotes'	=> 'remote'
+);
+
+sub slot_cascade {
+	my $r = shift @_;
+
+	my $as_tracked = grep { $_ && ($_ eq 'tracked') } @_;
+
+	if ( !$r->{'if_exists'} ) {
+		unshift @_, 'none';
+	} elsif ( $r->{'full_name'} =~ qr{^refs/(heads|tags|remotes)} ) {
+		if ( $1 eq 'heads' ) {
+			my $if_tracking = $r->{'if_tracking'};
+			if ( $if_tracking ) {
+				if ( $r->{'ahead'} || $r->{'behind'} ) {
+					if ( $r->{'if_updated'} ) {
+						push @_, ('updated', 'up-to-date');
+					} else {
+						push @_, ('failed', 'out-of-date');
+					}
+					push @_, ('candidate');
+				} else {
+					push @_, ('up-to-date');
+				}
+			}
+
+			push @_, ('dirty') if $r->{'if_dirty'};
+			push @_, ('current') if $r->{'if_current'};
+			push @_, ($if_tracking ? 'tracking' : 'non-tracking');
+
+		}
+
+		unshift @_, "tracked-$classic_slot{$1}" if $as_tracked;
+		push @_, ($1, $classic_slot{$1}, 'plain');
+	} else {
+		push @_, ('other', 'plain');
+	}
+
+	my $highlight_pattern = $OPTIONS{'highlight'};
+	if ( $highlight_pattern && ($r->{'full_name'} =~ /$highlight_pattern/) ) {
+		unshift @_, 'highlight';
+	}
+
+	return @_;
+}
+
+sub pin {
+	my($min, $v, $max) = @_;
+	return $min if $v < $min;
+	return $max if $max < $v;
+	return $v;
+}
+
+sub print_ref {
+	my($ref, $label_width, $as_tracked) = @_;
+
+	# a line of the final report comprises these parts (4 columns):
+	# [*] [...][ref-label][label-padding] [hash] [status][subject]
+	#     |                               |      |
+
+	# the ref to be printed fits into one of several natural categories (or 'slots'):
+	# 'local', 'remote', 'other', 'none'; the current branch is not just 'local', it's also 'current'
+	# additionally, we may be printing a given ref to show the tracked state of some earlier line
+	# based on the slot, we can enable distinct printing features.  This doesn't have
+	# to be a totally flexible system, though.  It's fine if only 'current' gets to set
+	# special margin text; and if only 'tracked' has an inner prefix.
+
+	# each of these slots can have an associated color; and for a given ref, we choose the
+	# first available color in this order:
+
+	# 'tracked' > 'current' > 'local'
+	# 'tracked' > 'remote'
+
+	# for all but 'tracked', we can determine the slot by examining the ref
+	# for 'tracked', we must be told
+
+	my $star_if_current	= $ref->{'if_current'} ? '*' : ' ';
+	$star_if_current	= get_color('bold') . $star_if_current . get_color('reset') if  $ref->{'if_dirty'};
+
+	my $dots_if_tracked	= $as_tracked ? '...' : '';
+
+	my $plain_label		= RefSpec::label($ref);
+	my $label_padding_width	= $label_width - (length($dots_if_tracked) + length($plain_label));
+	my $label		= get_color(slot_cascade($ref, $as_tracked ? 'tracked' : undef)) . $plain_label . get_color('reset');
+
+
+
+	my $status = "";
+	my $if_tracking = $ref->{'if_tracking'};
+	if ( $as_tracked ) {
+		$status = "";
+	} elsif ( !$ref->{'if_exists'} ) {
+		$status = reset_color(qw{none warning status}) . "not found";
+	} elsif ( $ref->{'full_name'} !~ m{^refs/heads/} ) {
+		# $status = "not a local branch";
+	} elsif ( !$if_tracking ) {
+		# $status = reset_color(qw{non-tracking warning status}) . "--no-track" if $OPTIONS{'verbose'};
+	}
+
+	my $ahead_msg = $ref->{'ahead'};
+	my @ahead_slots = qw{out-of-date warning status};
+	if ( $if_tracking && $ref->{'if_dirty'} ) {
+		$ahead_msg = ($ahead_msg || "0") . "+";
+		unshift @ahead_slots, qw{dirty};
+	}
+
+	my $behind_msg = $ref->{'behind'};
+	if ( $ahead_msg || $behind_msg ) {
+		if ( $ahead_msg ) {
+			$status .= ", " if $status;
+			$status .= reset_color(@ahead_slots) . "ahead $ahead_msg";
+		}
+
+		if ( $behind_msg ) {
+			$status .= ", " if $status;
+			$status .= reset_color(qw{out-of-date status}) . "behind $behind_msg";
+		}
+
+		if ( $if_tracking && $OPTIONS{'update'} && ($ref->{'ahead'} || $ref->{'behind'}) ) {
+			my $update_msg;
+			if ( $ref->{'if_updated'} ) {
+				$update_msg = reset_color(qw{updated up-to-date status}) . "updated";
+			} elsif ( $OPTIONS{'verbose'} ) {
+				$update_msg = reset_color(qw{failed warning out-of-date status}) . "failed";
+			}
+			if ( $update_msg ) {
+				$status .= ", " if $status;
+				$status .= $update_msg;
+			}
+		}
+	}
+
+	if ( $status ) {
+		$status = get_color('status') . '[' . $status . reset_color('status') . ']' . get_color('reset') . ' ';
+	}
+
+
+	my $hash_width = exists $OPTIONS{'short'} ? $OPTIONS{'short'} : 7;
+	$hash_width = pin(0, $hash_width, 40);
+	my $hash_col_width = $hash_width ? $hash_width+1 : 0;
+	printf("$star_if_current $dots_if_tracked$label%${label_padding_width}s %-${hash_col_width}s$status%s\n", '', substr($ref->{'hash'}||'', 0, $hash_width), $ref->{'subject'}||'');
+}
+
+
+sub report_loop {
+	my $op = shift @_;
+	my $width = shift @_;
+
+
+	# report_loop calls an arbitrary function, $op, on just the refs to be included in the report.
+	#   When $op is &print_ref, you get the report!  If instead of printing, though, $op grabs the
+	#   length of the refname to be printed, you can calculate the perfect width.  This scheme makes
+	#   it easy to get the width right _every_ time (with less code).
+
+	our %ref_scope = (
+		'invalid'	=> -1,
+		'current'	=> 0,
+		'local'		=> 0,
+		'remote'	=> 1,
+		'plain'		=> 2,
+		'other'		=> 2,
+	);
+	our $allowed_scope = 0;
+	$allowed_scope = 1 if $OPTIONS{'r'};
+	$allowed_scope = 2 if $OPTIONS{'a'};
+
+	# report_loop has just one job!  "Should I print this ref?"
+	sub if_show {
+		# Which refs get printed?
+		my($r) = @_;
+
+		# By default, the report includes
+		#	any refs that were candidates for update (whether we did or not)
+		#	any refs that were exact matches on the command line
+		return 1 if $r->{'if_updated'} || $r->{'behind'};
+		return 0 unless $r->{'if_explicit'};
+		return 1 unless $r->{'if_regexp_match'};
+
+		# Still here?  $r must be an explicit match for a pattern given on the command line;
+		#	include it in the report iff it falls inside the scope set by -r and -a.
+		return $allowed_scope >= $ref_scope{RefSpec::slot($r)};
+	};
+
+	our $opt_verbose = $OPTIONS{'verbose'};
+	sub if_show_tracked {
+		my($r) = @_;
+		return $r->{'if_tracking'} && (
+				($r->{'behind'} && !$r->{'if_updated'})
+				|| $allowed_scope && ($opt_verbose || $r->{'ahead'})
+			);
+	};
+
+	my %already_printed;
+	foreach my $lr ( @_ ){
+		next if $already_printed{$lr->{'full_name'}}++ || !if_show($lr);
+		$op->($lr, $width, 0);
+		next unless if_show_tracked($lr);
+
+		my $rr = RefSpec::inspect($lr->{'remote_branch'});
+		$op->($rr, $width, 1);
+		++$already_printed{$rr->{'full_name'}};
+	}
+}
+
+sub print_report {
+	my @refs = @_;
+	# Ask report_loop to find the width of the widest refname to be printed.
+	my $W = 0;
+	report_loop(sub { my($r, $x, $t)=@_; my $w=length(RefSpec::label($r))+($t?3:0); $W=$w if $W<$w; }, 0, @refs);
+	# Print, formatting to the width we calculated in the first pass.
+	report_loop(\&print_ref, $W, @refs);
+}
+
+}
+
+
+
+
+
+
+sub parse_command_line {
+	# returns a list of refspecs
+	our @refs;
+
+	sub handle_pattern_arg { my($expr)=@_; push @refs, RefSpec::select_matching($expr); }
+
+	GetOptions(
+		\%OPTIONS,
+		'help|h|?', 'version|V', 'license', 'debug|D',
+		'dry-run|n', 'fetch|f!', 'prune|p!', 'update|u!',
+		'verbose|v!', 'color!', 'highlight=s',
+		'<>' => \&handle_pattern_arg,
+		'r', 'a',
+	);
+
+	# if you specified --highlight on the command line,
+	# but _not_ any refs/patterns other than that, then
+	# use your highlight pattern as your selector
+	if ( $OPTIONS{'highlight'} && !@refs ) {
+		handle_pattern_arg($OPTIONS{'highlight'});
+	}
+
+	GetOptionsFromString(
+		git_string(qw{forward.branches ^refs/heads/}),
+		'<>'	=> \&handle_pattern_arg,
+		'r', 'a'
+	) unless @refs;
+
+
+
+	sub resolve_opt {
+		my $name = shift @_;
+		return unless $name;
+	
+		my @new_defaults;
+		push(@new_defaults, $OPTIONS{$name}) if defined $OPTIONS{$name};
+		if ( $OPTIONS{'dry-run'} ) {
+			my %DRYRUN_AFFECTS = ( 'fetch'=>1, 'prune'=>1, 'update'=>1 );
+			push(@new_defaults, 'false') if $DRYRUN_AFFECTS{$name};
+		}
+	
+		if ( @new_defaults ) {
+			@_ = ResolveOpt::_collapse_fns(@_);
+			splice @_, 1, 0, @new_defaults;
+		}
+		return $OPTIONS{$name} = git_bool(@_);
+	}
+
+	resolve_opt('dry-run', qw{false});
+	resolve_opt('verbose', qw{forward.verbose false});
+
+	my $opt_fetch = resolve_opt('fetch', qw{forward.fetch true});
+	resolve_opt('prune', { MAPPING=>{ 'auto'=>$opt_fetch } }, qw{forward.prune auto});
+	resolve_opt('update', qw{forward.update true});
+
+	my $stdout_is_tty = -t STDOUT;
+	resolve_opt('color', { MAPPING=>{ 'auto'=>$stdout_is_tty, 'true'=>$stdout_is_tty } }, qw{color.forward color.branch color.ui auto});
+
+	@highlight_cascade = ($OPTIONS{'highlight'}, "forward.highlight");
+	# push @highlight_cascade, "live|master|unstable" if $OPTIONS{'verbose'};
+	$OPTIONS{'highlight'} = git_string(@highlight_cascade);
+
+
+	debug_print_hash("resolved options", \%OPTIONS) if $OPTIONS{'debug'};
+
+
+	my $opt_version = $OPTIONS{'version'};
+	my $opt_help	= $OPTIONS{'help'};
+
+	if ( $OPTIONS{'license'} || ($opt_version && $OPTIONS{'verbose'}) ) {
+		license($opt_help);
+	} elsif ( $opt_version ) {
+		version($opt_help);
+	}
+	usage() if $opt_help;
+
+
+	return @refs;
+}
+
+
+sub update_ref {
+	my($ref, $new_value, $message) = @_;
+
+	# Make a ref point to an arbitrary commit; update the reflog.
+	# Be kind: only use this to fast-forward.  It's up to you to know what you're doing!
+
+	$ref->{'old_hash'} = $ref->{'hash'};
+	$ref->{'old_subject'} = $ref->{'subject'};
+
+	$REPO->command('update-ref', $ref->{'full_name'}, $new_value, '-m', $message);
+	$ref->{'if_updated'} = 1;
+
+	RefSpec::reinspect_commit($ref);
+}
+
+
+sub main {
+	my @refs = parse_command_line(@ARGV);
+	
+
+	# Fetch and prune if asked.  In the typical case, the bulk of our time is spent
+	#   finding out that there is nothing to fetch or prune.
+	my %repeated_remote = ('.' => 1 );
+	foreach my $remote (	map { $_->{'remote'} }
+				grep { $_->{'if_tracking'} && !$repeated_remote{$_->{'remote'}}++ }
+				@refs ) {
+		# Assumptions: almost always --fetch, and from only a handful of remotes; therefor
+		#   we have simpler code (and a negligible penalty) for testing within the loop.
+
+		$REPO->command_noisy('fetch', $remote) if $OPTIONS{'fetch'};
+		$REPO->command_noisy('remote', 'prune', $remote) if $OPTIONS{'prune'};
+	}
+	# Any remote refs related to our work-list are now as up-to-date in the repo as they are going
+	#   to be, allowing us to:
+
+
+	# Calculate ahead/behind for each tracking branch with respect to its remote.
+	RefSpec::reinspect_checkout(RefSpec::inspect('HEAD'));
+	foreach my $ref ( grep { $_->{'if_tracking'} } @refs ){
+		RefSpec::reinspect_tracking($ref);
+	}
+	# Knowing ahead/behind allows us to:
+
+
+	# Fast-forward any ref that's strictly behind its remote.
+	if ( $OPTIONS{'update'} ) {
+		foreach my $ref ( grep { $_->{'behind'} && !$_->{'ahead'} && !$_->{'if_dirty'} } @refs ){
+			update_ref($ref, $ref->{'remote_branch'}, 'forward');
+			system('git', 'checkout', '-f', 'HEAD') if $ref->{'if_current'};
+		}
+	}
+	Report::print_report(@refs); # ...using what I've recorded in the elements of @refs.
+
+	Report::debug_color_cache() if $OPTIONS{'debug'};
+}
+
+main();
+
+__END__
