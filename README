@@ -12,7 +12,7 @@ Description:
 	where it was trivial to do so).
 
 	It provides full Perl-style regular expression matching against refnames
-	in your repo.  E.g., to see topic branches 
+	in your repo.  E.g., to see topic branches
 
 	Considers the provided local branches, or else all local branches.
 	For any remote referenced by those branches, fetch and then prune as
@@ -21,7 +21,7 @@ Description:
 	Unless this is just a --dry-run, any of the considered branches that are
 	strictly behind (contained by) their tracked branch are fast-forwarded
 	to the tracked tip.  Uncommitted changes are protected---they count as
-	behing 'ahead' of the tracked branch.
+	being 'ahead' of the tracked branch.
 
 Usage:
 
